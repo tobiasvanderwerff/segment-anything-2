@@ -64,12 +64,49 @@ class MultiScaleAttention(nn.Module):
             H, W = q.shape[1:3]  # downsampled shape
             q = q.reshape(B, H * W, self.num_heads, -1)
 
+        """
+        This part leads to big memory spikes (about 8x more than other ops) for 
+        certain layers (I think the layers where window_size==0). See the
+        HTML memory graph for details. I avoid this by doing the attention
+        computation in a loop over batches.
+        """
+
         # Torch's SDPA expects [B, nheads, H*W, C] so we transpose
-        x = F.scaled_dot_product_attention(
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
-        )
+        # print(f"Before: {torch.cuda.memory_allocated()/1e9} GB")
+        if 1:
+            if q.shape[1] == 4096:  # hacky but works for now
+                # do each batch dimension separately
+                q_t = q.transpose(1, 2)
+                k_t = k.transpose(1, 2)
+                v_t = v.transpose(1, 2)
+                x = torch.zeros_like(q_t)
+                for i in range(q.shape[0]):
+                    x[i] = F.scaled_dot_product_attention(
+                        q[i].transpose(0, 1),
+                        k[i].transpose(0, 1),
+                        v[i].transpose(0, 1),
+                    )
+                # assert q_t.shape[0] % 4 == 0
+                # for i in range(q_t.shape[0]//4):
+                #     x[4*i:4*(i+1)] = F.scaled_dot_product_attention(
+                #         q_t[4*i:4*(i+1)],
+                #         k_t[4*i:4*(i+1)],
+                #         v_t[4*i:4*(i+1)],
+                #     )
+            # print(f"After: {torch.cuda.memory_allocated()/1e9} GB\n")
+            else:
+                x = F.scaled_dot_product_attention(
+                    q.transpose(1, 2),
+                    k.transpose(1, 2),
+                    v.transpose(1, 2),
+                )
+        else:
+            # with torch.backends.cuda.sdp_kernel(enable_flash=False):  # doesn't seem to make a difference
+            x = F.scaled_dot_product_attention(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+            )
         # Transpose back
         x = x.transpose(1, 2)
         x = x.reshape(B, H, W, -1)
@@ -139,7 +176,7 @@ class MultiScaleBlock(nn.Module):
 
         # Window partition
         window_size = self.window_size
-        if window_size > 0:
+        if window_size > 0:  # TVDW: i ==23 has window_size = 0
             H, W = x.shape[1], x.shape[2]
             x, pad_hw = window_partition(x, window_size)
 
